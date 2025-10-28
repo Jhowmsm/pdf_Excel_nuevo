@@ -19,15 +19,21 @@ app = FastAPI(
 )
 
 # Habilita peticiones desde GitHub Pages y también localhost (para pruebas)
+from fastapi.middleware.cors import CORSMiddleware
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
+        # Codespaces backend y frontend
+        "https://weary-cape-v6gp9gxg7jj52wqpw-8001.app.github.dev/procesar/",
+        "https://weary-cape-v6gp9gxg7jj52wqpw-5500.app.github.dev",
+
+        # Opcionales / locales / futuros
         "http://localhost:5500",
         "http://127.0.0.1:5500",
         "http://localhost:8000",
         "http://127.0.0.1:8000",
         "https://jhowmsm.github.io",
-        "https://weary-cape-v6gp9gxg7jj52wqpw-8000.app.github.dev/"
     ],
     allow_credentials=True,
     allow_methods=["*"],
