@@ -204,7 +204,9 @@
   </div>
 
   <script>
-    // URL del backend FastAPI (ajústala después del deploy)
+    // ⬇⬇⬇ IMPORTANTE: esta URL DEBE ser la pública del backend en Codespaces puerto 8001
+    // y debe terminar en /procesar/
+    // si tu codespace cambia de nombre, actualiza aquí
     const API_URL = "https://weary-cape-v6gp9gxg7jj52wqpw-8001.app.github.dev/procesar/";
 
     function mostrarNombreArchivo() {
@@ -239,7 +241,7 @@
       }
     }
 
-    // Rellena automáticamente las 4 columnas típicas del formato que nos compartiste
+    // Rellena automáticamente las 4 columnas tipo de tu PDF
     function cargarFormatoDefault() {
       document.getElementById("numColumnas").value = 4;
       generarInputs();
@@ -253,7 +255,7 @@
       ];
       for (let i = 0; i < headers.length; i++) {
         refs[i].value = headers[i];
-        excls[i].value = headers[i]; // por defecto excluir el mismo header
+        excls[i].value = headers[i]; // excluir el encabezado en sí
       }
     }
 
@@ -326,7 +328,7 @@
       }
     }
 
-    // inicializa con el formato de 4 columnas
+    // inicializa formulario con las 4 columnas
     cargarFormatoDefault();
   </script>
 </body>
