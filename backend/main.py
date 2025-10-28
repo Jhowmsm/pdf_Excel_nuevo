@@ -7,12 +7,11 @@ import uuid
 import json
 import re
 from openpyxl import Workbook
-from openpyxl.styles import PatternFill
 
 app = FastAPI(
-    title="PDF Table Extractor",
-    description="Extrae columnas PDF → Excel usando detección de NIF como ancla.",
-    version="1.4.0"
+    title="PDF Table Extractor (RAW mode)",
+    description="Extrae filas crudas de tablas PDF y las vuelca en Excel para post-procesar.",
+    version="2.0.0"
 )
 
 # ⚠ Ajusta dominios si tu codespace cambia de nombre
@@ -32,10 +31,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Regex general para IDs fiscales españoles típicos:
-# - CIF: letra + 8 dígitos  (B26249896)
-# - NIF: 8 dígitos + letra  (40313009N)
-# - NIE: [XYZ] + 7 dígitos + letra (X1234567A)
+# Detecta NIF/NIE/CIF
 PAT_ID_GENERAL = re.compile(
     r"""^(
         [A-Z]\d{8}           |   # CIF tipo B26249896
@@ -48,6 +44,16 @@ PAT_ID_GENERAL = re.compile(
 def es_id_fiscal(token: str) -> bool:
     token = token.strip().replace(" ", "")
     return bool(PAT_ID_GENERAL.match(token))
+
+# Para la hoja NIE_Warnings (sacamos todos los IDs fiscales que aparezcan)
+PAT_ID_GLOBAL = re.compile(
+    r"""(
+        [A-Z]\d{8}           |
+        \d{8}[A-Z]           |
+        [XYZ]\d{7}[A-Z]
+    )""",
+    re.VERBOSE
+)
 
 def normalizar(s: str) -> str:
     import unicodedata
@@ -71,16 +77,6 @@ def header_match(span_text: str, referencia: str) -> bool:
             return True
     return False
 
-# Para hoja NIE_Warnings (detección global en rango):
-PAT_ID_GLOBAL = re.compile(
-    r"""(
-        [A-Z]\d{8}           |
-        \d{8}[A-Z]           |
-        [XYZ]\d{7}[A-Z]
-    )""",
-    re.VERBOSE
-)
-
 @app.post("/procesar/")
 async def procesar_pdf(
     file: UploadFile = File(...),
@@ -90,61 +86,63 @@ async def procesar_pdf(
     pagina_fin: int = Form(...)
 ):
     """
-    Flujo:
-      - Recibe PDF + rango de páginas (1-based)
-      - Agrupa texto por filas visuales (Y-cercano)
-      - Para cada fila, ordena spans por X
-      - Usa el primer token con pinta de NIF/CIF/NIE (9 chars-ish) como frontera:
-          antes  -> nombre completo / razón social
-          token  -> NIF/CIF/NIE
-          después-> MARCA, MATRÍCULA
+    Modo RAW:
+    - Lee únicamente las páginas [pagina_inicio-1 .. pagina_fin-1]
+    - A partir de la primera página donde vea headers tipo 'NOMBRE...', 'NIF', etc.,
+      empieza a capturar filas.
+    - Para cada fila visual:
+        - Ordena spans por X
+        - Concatena TODOS los spans en orden -> RAW_LINE
+        - Detecta el primer token que parece NIF/CIF/NIE -> NIF_DETECTADO
+        - Después del NIF, primer token -> MARCA_POSIBLE
+        - Después del NIF, segundo token -> MATRICULA_POSIBLE
+    - Excel final: columnas RAW_LINE, NIF_DETECTADO, MARCA_POSIBLE, MATRICULA_POSIBLE
     """
 
-    # 1. Cargar referencias / exclusiones (igual que antes)
+    # 1. Parsear los extras del formulario
     try:
         referencias_list: List[str] = json.loads(referencias)
         exclusiones_map: Dict[str, List[str]] = json.loads(exclusiones)
     except Exception:
         return {"error": "No se pudo leer referencias o exclusiones"}
 
-    # 2. Ajustar páginas a base 0
     start_page = max(pagina_inicio - 1, 0)
     end_page = max(pagina_fin - 1, start_page)
 
+    # 2. Guardar PDF temporal
     original_name = file.filename or "archivo.pdf"
     temp_pdf = f"/tmp/{uuid.uuid4().hex}_{original_name}"
     with open(temp_pdf, "wb") as f:
         f.write(await file.read())
 
+    # 3. Abrir con PyMuPDF
     doc = fitz.open(temp_pdf)
     end_page = min(end_page, len(doc) - 1)
 
-    # 3. Detectar IDs fiscales globales en el rango para la hoja de warnings
+    # 4. Detectar IDs fiscales globales (para la pestaña NIE_Warnings)
     ids_detectados = set()
     for pageno in range(start_page, end_page + 1):
         page_text = doc[pageno].get_text("text")
         for m in PAT_ID_GLOBAL.findall(page_text):
             ids_detectados.add(m.strip())
 
-    # 4. Agrupar spans por fila visual (Y)
-    TOL_Y = 4
-    filas_totales: List[Dict[str, str]] = []
+    TOL_Y = 4  # tolerancia vertical
 
-    # Bandera de "solo procesar después de ver una cabecera real"
-    en_modo_tabla = False
+    filas_totales = []
 
+    en_modo_tabla = False  # aún no hemos visto cabecera de tabla
+
+    # 5. Recorremos sólo el rango de páginas
     for pageno in range(start_page, end_page + 1):
         page = doc[pageno]
         page_dict = page.get_text("dict")
 
-        # 4.1 Detectar si esta página contiene encabezados tipo
-        # "NOMBRE Y APELLIDOS O RAZÓN SOCIAL", "NIF", "MARCA", "MATRÍCULA"
+        # 5.1 ¿Esta página parece tener cabecera?
         pagina_tiene_header = False
         for block in page_dict["blocks"]:
             for line in block.get("lines", []):
                 for span in line.get("spans", []):
                     texto_span = span["text"].strip()
-                    # si cualquier referencia coincide, asumimos que ya estamos en la tabla
                     for ref in referencias_list:
                         if header_match(texto_span, ref):
                             pagina_tiene_header = True
@@ -153,11 +151,11 @@ async def procesar_pdf(
         if pagina_tiene_header:
             en_modo_tabla = True
 
-        # Si aún no hemos visto headers, saltamos esta página
+        # si todavía no hemos llegado a las tablas, saltar
         if not en_modo_tabla:
             continue
 
-        # 4.2 Construir filas "crudas": lista de (y_centro, spans_de_fila[])
+        # 5.2 Agrupar spans por fila visual Y
         filas_pag_cruda: List[Tuple[float, List[dict]]] = []
 
         for block in page_dict["blocks"]:
@@ -169,7 +167,7 @@ async def procesar_pdf(
                 ys = [s["bbox"][1] for s in spans] + [s["bbox"][3] for s in spans]
                 y_centro = (min(ys) + max(ys)) / 2.0
 
-                # buscar fila existente cercana
+                # buscar fila con Y cercano
                 fila_idx = None
                 for idx, (y_exist, _) in enumerate(filas_pag_cruda):
                     if abs(y_exist - y_centro) <= TOL_Y:
@@ -185,15 +183,16 @@ async def procesar_pdf(
                     if not texto_span:
                         continue
 
-                    # filtrar numeritos sueltos tipo número de página
+                    # descartamos cosas que no son contenido de fila:
+                    # - numeritos tipo "51"
                     if re.fullmatch(r"\d{1,3}", texto_span):
                         continue
 
-                    # filtrar cabeceras repetidas
+                    # - encabezados repetidos
                     if any(header_match(texto_span, ref) for ref in referencias_list):
                         continue
 
-                    # filtrar exclusiones explícitas
+                    # - exclusiones explícitas (por ejemplo, el nombre del header)
                     skip_it = False
                     for ref in referencias_list:
                         if texto_span in exclusiones_map.get(ref, []):
@@ -206,93 +205,77 @@ async def procesar_pdf(
                     filas_pag_cruda[fila_idx][1].append({
                         "text": texto_span,
                         "x0": x0,
-                        "y0": y0,
-                        "x1": x1,
-                        "y1": y1
                     })
 
-        # 4.3 Parsear cada fila cruda usando el patrón NIF como ancla
+        # 5.3 Procesar cada fila cruda en modo "lineal"
         for (_, spans_de_fila) in filas_pag_cruda:
             if not spans_de_fila:
                 continue
 
-            # Ordenar los spans de la fila por posición izquierda→derecha
-            spans_ordenados = sorted(spans_de_fila, key=lambda sp: sp["x0"])
+            # ordenar TODOS los spans de la fila de izquierda a derecha
+            spans_sorted = sorted(spans_de_fila, key=lambda sp: sp["x0"])
 
-            buffer_nombre: List[str] = []
-            nif_val = ""
+            # reconstrucción lineal
+            tokens_line = [sp["text"] for sp in spans_sorted]
+            raw_line = " ".join(tokens_line).strip()
+
+            # detectar el primer identificador fiscal
+            nif_detectado = ""
             marca_val = ""
             matric_val = ""
 
-            fase = "nombre"
-
-            for sp in spans_ordenados:
-                token = sp["text"].strip()
-
-                if fase == "nombre":
-                    # ¿Este token es un posible NIF/CIF/NIE?
-                    if es_id_fiscal(token):
-                        nif_val = token
-                        fase = "post-nif"
-                    else:
-                        buffer_nombre.append(token)
-
-                elif fase == "post-nif":
-                    # Después del NIF: primer token -> MARCA, segundo -> MATRÍCULA
+            fase = "antes_nif"
+            for tok in tokens_line:
+                if fase == "antes_nif":
+                    if es_id_fiscal(tok):
+                        nif_detectado = tok
+                        fase = "despues_nif"
+                elif fase == "despues_nif":
                     if not marca_val:
-                        marca_val = token
+                        marca_val = tok
                     elif not matric_val:
-                        matric_val = token
+                        matric_val = tok
                     else:
-                        # si hay tokens extra, los podemos concatenar a matrícula
-                        matric_val = (matric_val + " " + token).strip()
+                        # Si aparece texto extra después de matrícula, podemos anexarlo a matrícula
+                        matric_val = (matric_val + " " + tok).strip()
 
-            nombre_full = " ".join(buffer_nombre).strip()
-
-            # descartamos filas totalmente vacías
-            if not (nombre_full or nif_val or marca_val or matric_val):
+            # descartamos filas que están demasiado vacías
+            if not raw_line:
                 continue
 
             filas_totales.append({
-                "NOMBRE": nombre_full,
-                "NIF": nif_val,
-                "MARCA": marca_val,
-                "MATRICULA": matric_val
+                "RAW_LINE": raw_line,
+                "NIF_DETECTADO": nif_detectado,
+                "MARCA_POSIBLE": marca_val,
+                "MATRICULA_POSIBLE": matric_val
             })
 
     doc.close()
 
-    # 5. Crear Excel
+    # 6. Crear Excel final en modo RAW
     wb = Workbook()
     ws = wb.active
-    ws.title = "Resultados"
+    ws.title = "RAW_FILAS"
 
     ws.append([
-        "NOMBRE Y APELLIDOS O RAZÓN SOCIAL",
-        "NIF",
-        "MARCA",
-        "MATRÍCULA",
+        "RAW_LINE",
+        "NIF_DETECTADO",
+        "MARCA_POSIBLE",
+        "MATRICULA_POSIBLE"
     ])
 
-    amarillo = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
-
     for fila in filas_totales:
-        row_vals = [
-            fila.get("NOMBRE", ""),
-            fila.get("NIF", ""),
-            fila.get("MARCA", ""),
-            fila.get("MATRICULA", "")
-        ]
-        ws.append(row_vals)
+        ws.append([
+            fila.get("RAW_LINE", ""),
+            fila.get("NIF_DETECTADO", ""),
+            fila.get("MARCA_POSIBLE", ""),
+            fila.get("MATRICULA_POSIBLE", "")
+        ])
 
-        current_row_idx = ws.max_row
-        nombre_val = ws.cell(current_row_idx, 1).value or ""
-        if len(nombre_val) > 60:
-            ws.cell(current_row_idx, 1).fill = amarillo
-
+    # Hoja secundaria con todos los IDs fiscales detectados en el rango
     if ids_detectados:
         ws_alerta = wb.create_sheet("NIE_Warnings")
-        ws_alerta.append(["NIF/NIE Detectados"])
+        ws_alerta.append(["NIF/NIE/CIF Detectados"])
         for codigo in sorted(ids_detectados):
             ws_alerta.append([codigo])
 
