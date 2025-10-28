@@ -1,0 +1,333 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <title>Extractor de tablas PDF → Excel</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      background: #f3f4f6;
+      padding: 2rem;
+      color: #333;
+      max-width: 900px;
+      margin: 0 auto;
+    }
+    h1 {
+      text-align: center;
+      font-size: 1.3rem;
+      margin-bottom: 1rem;
+      color: #111827;
+    }
+    .card {
+      background: #fff;
+      border-radius: 12px;
+      padding: 1rem 1.25rem;
+      box-shadow: 0 10px 20px rgba(0,0,0,0.05);
+      border: 1px solid #e5e7eb;
+      margin-bottom: 1.5rem;
+    }
+    .row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 1rem;
+    }
+    .col {
+      flex: 1;
+      min-width: 260px;
+    }
+    label {
+      font-size: 0.8rem;
+      font-weight: 600;
+      color: #374151;
+      display: block;
+      margin-bottom: 0.25rem;
+    }
+    input[type="text"], input[type="number"] {
+      width: 100%;
+      font-size: 0.8rem;
+      padding: 0.5rem 0.6rem;
+      border-radius: 6px;
+      border: 1px solid #9ca3af;
+      box-sizing: border-box;
+      margin-bottom: 0.5rem;
+      background-color: #fff;
+    }
+    input[type="text"]:focus, input[type="number"]:focus {
+      outline: 2px solid #3b82f6;
+      border-color: #3b82f6;
+    }
+    .uploader {
+      border: 2px dashed #3b82f6;
+      border-radius: 12px;
+      background: #e0f2fe;
+      padding: 1.5rem;
+      text-align: center;
+      margin-bottom: 1rem;
+      position: relative;
+    }
+    .uploader input[type="file"] {
+      display: none;
+    }
+    .uploader label {
+      display: inline-block;
+      padding: 0.6rem 1rem;
+      background-color: #3b82f6;
+      color: white;
+      border-radius: 8px;
+      cursor: pointer;
+      font-size: 0.8rem;
+      font-weight: 600;
+    }
+    .file-name {
+      margin-top: 0.75rem;
+      font-style: italic;
+      color: #374151;
+      font-size: 0.8rem;
+    }
+
+    button.action {
+      padding: 0.75rem 1.5rem;
+      background-color: #10b981;
+      color: white;
+      border: none;
+      border-radius: 8px;
+      cursor: pointer;
+      font-weight: bold;
+      font-size: 0.9rem;
+    }
+    button.outline {
+      padding: 0.5rem 1rem;
+      background-color: transparent;
+      color: #3b82f6;
+      border: 1px solid #3b82f6;
+      border-radius: 8px;
+      cursor: pointer;
+      font-weight: 600;
+      font-size: 0.8rem;
+    }
+    .small-hint {
+      font-size: 0.7rem;
+      line-height: 1rem;
+      color: #6b7280;
+    }
+
+    .columna-container {
+      background: #f9fafb;
+      border: 1px solid #d1d5db;
+      padding: 0.75rem;
+      border-radius: 8px;
+      margin-bottom: 0.75rem;
+    }
+    .referencias-box {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.5rem;
+      margin-top: 0.5rem;
+    }
+    .referencias-box span {
+      background-color: #facc15;
+      padding: 0.5rem 0.75rem;
+      border-radius: 6px;
+      font-weight: bold;
+      cursor: pointer;
+      font-size: 0.75rem;
+    }
+
+    #estado {
+      font-size: 0.8rem;
+      font-weight: 600;
+      margin-top: 0.75rem;
+    }
+    #estado.ok {
+      color: #065f46;
+    }
+    #estado.err {
+      color: #991b1b;
+    }
+  </style>
+</head>
+<body>
+
+  <h1>Extractor de tablas PDF → Excel</h1>
+
+  <!-- Config columnas -->
+  <div class="card">
+    <div style="display:flex;justify-content:space-between;align-items:flex-end;flex-wrap:wrap;gap:1rem;">
+      <div>
+        <label for="numColumnas">¿Cuántas columnas deseas extraer?</label>
+        <input type="number" id="numColumnas" min="1" max="10" value="4">
+      </div>
+      <div>
+        <button class="outline" onclick="generarInputs()">Generar campos</button>
+        <button class="outline" onclick="cargarFormatoDefault()">Formato tabla vehículos</button>
+      </div>
+    </div>
+
+    <div class="small-hint">
+      Cada columna necesita:<br>
+      - Referencia: el encabezado tal cual aparece en el PDF (o muy parecido)<br>
+      - Exclusiones: textos que NO quieres guardar (por ejemplo el propio encabezado repetido)
+    </div>
+  </div>
+
+  <div class="card">
+    <div id="inputsWrapper" class="row">
+      <div id="leftColumn" class="col"></div>
+      <div id="rightColumn" class="col"></div>
+    </div>
+  </div>
+
+  <!-- Sugerencias rápidas -->
+  <div class="card">
+    <label>Insertar encabezado sugerido:</label>
+    <div class="referencias-box" id="sugerencias">
+      <span onclick="agregarReferencia('NOMBRE Y APELLIDOS O RAZÓN SOCIAL')">Nombre / Razón Social</span>
+      <span onclick="agregarReferencia('NIF')">NIF</span>
+      <span onclick="agregarReferencia('MARCA')">Marca</span>
+      <span onclick="agregarReferencia('MATRÍCULA')">Matrícula</span>
+    </div>
+    <div class="small-hint">
+      Puedes hacer click y se rellena el primer campo vacío de "Referencia".
+    </div>
+  </div>
+
+  <!-- Subida PDF -->
+  <div class="card">
+    <div class="uploader">
+      <label for="fileInput">Seleccionar PDF</label>
+      <input type="file" id="fileInput" accept="application/pdf" onchange="mostrarNombreArchivo()">
+      <div id="fileName" class="file-name"></div>
+    </div>
+
+    <button class="action" onclick="subir()">Procesar PDF</button>
+    <p id="estado"></p>
+  </div>
+
+  <script>
+    // URL del backend FastAPI (ajústala después del deploy)
+    const API_URL = "https://weary-cape-v6gp9gxg7jj52wqpw-8000.app.github.dev/";
+
+    function mostrarNombreArchivo() {
+      const file = document.getElementById('fileInput').files[0];
+      const nameBox = document.getElementById('fileName');
+      nameBox.textContent = file ? `Archivo seleccionado: ${file.name}` : "";
+    }
+
+    function generarInputs() {
+      const left = document.getElementById("leftColumn");
+      const right = document.getElementById("rightColumn");
+      left.innerHTML = "";
+      right.innerHTML = "";
+
+      const num = parseInt(document.getElementById("numColumnas").value);
+      const mitad = Math.ceil(num / 2);
+
+      for (let i = 0; i < num; i++) {
+        const div = document.createElement("div");
+        div.className = "columna-container";
+        div.innerHTML = `
+          <label>Referencia columna ${i + 1}</label>
+          <input type="text" class="referencia" placeholder="Ej: NIF" required>
+          <label>Valores a excluir (coma ,)</label>
+          <input type="text" class="excluir" placeholder="Ej: NIF, MARCA, MATRÍCULA">
+        `;
+        if (i < mitad) {
+          left.appendChild(div);
+        } else {
+          right.appendChild(div);
+        }
+      }
+    }
+
+    // Rellena automáticamente las 4 columnas típicas del formato que nos compartiste
+    function cargarFormatoDefault() {
+      document.getElementById("numColumnas").value = 4;
+      generarInputs();
+      const refs = document.querySelectorAll("input.referencia");
+      const excls = document.querySelectorAll("input.excluir");
+      const headers = [
+        "NOMBRE Y APELLIDOS O RAZÓN SOCIAL",
+        "NIF",
+        "MARCA",
+        "MATRÍCULA"
+      ];
+      for (let i = 0; i < headers.length; i++) {
+        refs[i].value = headers[i];
+        excls[i].value = headers[i]; // por defecto excluir el mismo header
+      }
+    }
+
+    // Mete una referencia sugerida en el primer campo vacío
+    function agregarReferencia(valor) {
+      const inputs = document.querySelectorAll("input.referencia");
+      for (let i = 0; i < inputs.length; i++) {
+        if (!inputs[i].value) {
+          inputs[i].value = valor;
+          return;
+        }
+      }
+    }
+
+    async function subir() {
+      const file = document.getElementById('fileInput').files[0];
+      const referencias = [];
+      const exclusiones = {};
+
+      const bloques = document.querySelectorAll(".columna-container");
+      bloques.forEach(bloque => {
+        const ref = bloque.querySelector(".referencia").value.trim();
+        const excluirStr = bloque.querySelector(".excluir").value.trim();
+        const excluir = excluirStr
+          ? excluirStr.split(",").map(e => e.trim()).filter(Boolean)
+          : [];
+        if (ref) {
+          referencias.push(ref);
+          exclusiones[ref] = excluir;
+        }
+      });
+
+      if (!file || referencias.length === 0) {
+        alert("Selecciona un PDF y completa al menos una referencia.");
+        return;
+      }
+
+      const formData = new FormData();
+      formData.append("file", file);
+      formData.append("referencias", JSON.stringify(referencias));
+      formData.append("exclusiones", JSON.stringify(exclusiones));
+
+      const estado = document.getElementById("estado");
+      estado.className = "";
+      estado.innerText = "Procesando PDF...";
+
+      try {
+        const response = await fetch(API_URL, {
+          method: "POST",
+          body: formData
+        });
+
+        if (response.ok) {
+          const blob = await response.blob();
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement("a");
+          a.href = url;
+          a.download = "resultado.xlsx";
+          a.click();
+          estado.className = "ok";
+          estado.innerText = "¡Listo! Excel descargado.";
+        } else {
+          estado.className = "err";
+          estado.innerText = "Error al procesar en el servidor.";
+        }
+      } catch (e) {
+        console.error(e);
+        estado.className = "err";
+        estado.innerText = "No se pudo conectar al servidor.";
+      }
+    }
+
+    // inicializa con el formato de 4 columnas
+    cargarFormatoDefault();
+  </script>
+</body>
+</html>
