@@ -11,16 +11,16 @@ from openpyxl.styles import PatternFill
 
 app = FastAPI(
     title="PDF Table Extractor",
-    description="Extrae columnas de tablas en PDF y las exporta a Excel.",
-    version="1.1.0"
+    description="Extrae columnas de tablas en PDF y las exporta a Excel (rango de páginas).",
+    version="1.2.0"
 )
 
-# ⚠ Ajusta estos dos dominios si tu codespace cambia de nombre
+# ⚠ Ajusta estos dominios si el codespace cambia de nombre
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "https://weary-cape-v6gp9gxg7jj52wqpw-8001.app.github.dev",
-        "https://weary-cape-v6gp9gxg7jj52wqpw-5500.app.github.dev",
+        "https://weary-cape-v6gp9gxg7jj52wqpw-8001.app.github.dev",  # backend
+        "https://weary-cape-v6gp9gxg7jj52wqpw-5500.app.github.dev",  # frontend
         "http://localhost:5500",
         "http://127.0.0.1:5500",
         "http://localhost:8000",
@@ -54,12 +54,11 @@ def header_match(span_text: str, referencia: str) -> bool:
             return True
     return False
 
-# regex captura NIF/NIE
 PAT_ID = re.compile(
     r"""(
-        [XYZ]\d{7}[A-Z]      # NIE tipo X/Y/Z
+        [XYZ]\d{7}[A-Z]      # NIE X/Y/Z
         |
-        \d{8}[A-Z]           # NIF clásico
+        \d{8}[A-Z]           # NIF 12345678Z
     )""",
     re.VERBOSE
 )
@@ -68,13 +67,25 @@ PAT_ID = re.compile(
 async def procesar_pdf(
     file: UploadFile = File(...),
     referencias: str = Form(...),
-    exclusiones: str = Form("{}")
+    exclusiones: str = Form("{}"),
+    pagina_inicio: int = Form(...),
+    pagina_fin: int = Form(...)
 ):
+    """
+    pagina_inicio y pagina_fin vienen 1-based desde el frontend.
+    Vamos a convertirlos a índices 0-based internamente.
+    Solo procesamos ese rango.
+    """
+
     try:
         referencias_list: List[str] = json.loads(referencias)
         exclusiones_map: Dict[str, List[str]] = json.loads(exclusiones)
     except Exception:
         return {"error": "No se pudo leer referencias o exclusiones"}
+
+    # Ajustar páginas a base 0
+    start_page = max(pagina_inicio - 1, 0)
+    end_page = max(pagina_fin - 1, start_page)
 
     original_name = file.filename or "archivo.pdf"
     temp_pdf = f"/tmp/{uuid.uuid4().hex}_{original_name}"
@@ -83,12 +94,8 @@ async def procesar_pdf(
 
     doc = fitz.open(temp_pdf)
 
-    # Detectar NIF/NIE global
-    ids_detectados = set()
-    for page in doc:
-        page_text = page.get_text("text")
-        for m in PAT_ID.findall(page_text):
-            ids_detectados.add(m)
+    # limitar a rango válido
+    end_page = min(end_page, len(doc) - 1)
 
     MARGEN_X = 25
     TOL_Y = 4
@@ -96,40 +103,43 @@ async def procesar_pdf(
     todas_filas: List[Dict[str, str]] = []
     ref_x_global: Dict[str, float] = {}
 
-    # 🔑 nueva bandera:
-    # hasta que no encontremos la cabecera real de la tabla, no capturamos filas
+    # Detectar NIF/NIE solo en el rango de páginas
+    ids_detectados = set()
+    for pageno in range(start_page, end_page + 1):
+        page = doc[pageno]
+        page_text = page.get_text("text")
+        for m in PAT_ID.findall(page_text):
+            ids_detectados.add(m)
+
+    # Bandera igual que antes: no empiezo a capturar hasta ver headers
     en_modo_tabla = False
 
-    for page in doc:
+    for pageno in range(start_page, end_page + 1):
+        page = doc[pageno]
         page_dict = page.get_text("dict")
 
-        # 1. Detectar headers en esta página
         pagina_tiene_header = False
 
+        # 1. Detectar headers en ESTA página dentro del rango
         for block in page_dict["blocks"]:
             for line in block.get("lines", []):
                 for span in line.get("spans", []):
                     texto_span = span["text"].strip()
                     x0, y0, x1, y1 = span["bbox"]
 
-                    # si este span parece uno de los encabezados pedidos, guardar su X
                     for ref in referencias_list:
                         if header_match(texto_span, ref):
                             pagina_tiene_header = True
                             if ref not in ref_x_global:
                                 ref_x_global[ref] = x0
 
-        # si encontramos una cabecera completa en esta página,
-        # activamos el modo tabla para esta y las siguientes páginas
         if pagina_tiene_header:
             en_modo_tabla = True
 
-        # si AÚN no hemos encontrado cabecera en todo el documento:
-        # saltamos completamente esta página (no recolectamos filas sueltas)
         if not en_modo_tabla:
             continue
 
-        # 2. Si ya estamos en modo tabla: agrupar spans en filas
+        # 2. Agrupar spans en filas visuales
         filas_pag: List[Tuple[float, Dict[str, str]]] = []
 
         for block in page_dict["blocks"]:
@@ -141,7 +151,6 @@ async def procesar_pdf(
                 ys = [s["bbox"][1] for s in spans] + [s["bbox"][3] for s in spans]
                 y_centro = (min(ys) + max(ys)) / 2.0
 
-                # buscar fila cercana por Y
                 fila_idx = None
                 for idx, (y_exist, data_dict) in enumerate(filas_pag):
                     if abs(y_exist - y_centro) <= TOL_Y:
@@ -159,26 +168,25 @@ async def procesar_pdf(
                     if not texto_span:
                         continue
 
-                    # saltar filas que son el header mismo
+                    # saltar header repetido
                     if any(header_match(texto_span, ref) for ref in referencias_list):
                         continue
 
-                    # saltar exclusiones explícitas
-                    salta_por_exclusion = False
+                    # saltar exclusiones
+                    exclu = False
                     for ref in referencias_list:
                         if texto_span in exclusiones_map.get(ref, []):
-                            salta_por_exclusion = True
+                            exclu = True
                             break
-                    if salta_por_exclusion:
+                    if exclu:
                         continue
 
-                    # saltar numeritos tipo "51" que suelen ser nº de página
+                    # saltar numeritos tipo nº de página
                     if re.fullmatch(r"\d{1,3}", texto_span):
                         continue
 
                     x0, y0, x1, y1 = s["bbox"]
 
-                    # decidir a qué columna pertenece este span
                     mejor_ref = None
                     mejor_dist = None
                     for ref, ref_x in ref_x_global.items():
@@ -195,18 +203,17 @@ async def procesar_pdf(
                             nuevo = texto_span
                         filas_pag[fila_idx][1][mejor_ref] = nuevo
 
-        # agregar filas de esta página
+        # guardar filas de esta página
         for y_centro, data_dict in filas_pag:
             if any(v.strip() for v in data_dict.values()):
                 todas_filas.append(data_dict)
 
     doc.close()
 
-    # 3. Generar Excel
+    # 3. Generar Excel con los resultados
     wb = Workbook()
     ws = wb.active
     ws.title = "Resultados"
-
     ws.append(referencias_list)
 
     amarillo = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
