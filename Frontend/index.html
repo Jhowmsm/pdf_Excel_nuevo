@@ -152,21 +152,35 @@
 
   <!-- Config columnas -->
   <div class="card">
-    <div style="display:flex;justify-content:space-between;align-items:flex-end;flex-wrap:wrap;gap:1rem;">
-      <div>
+    <div class="row" style="gap:2rem;">
+      <div class="col" style="min-width:200px;max-width:220px;">
         <label for="numColumnas">¿Cuántas columnas deseas extraer?</label>
         <input type="number" id="numColumnas" min="1" max="10" value="4">
-      </div>
-      <div>
-        <button class="outline" onclick="generarInputs()">Generar campos</button>
-        <button class="outline" onclick="cargarFormatoDefault()">Formato tabla vehículos</button>
-      </div>
-    </div>
 
-    <div class="small-hint">
-      Cada columna necesita:<br>
-      - Referencia: el encabezado tal cual aparece en el PDF (o muy parecido)<br>
-      - Exclusiones: textos que NO quieres guardar (por ejemplo el propio encabezado repetido)
+        <div class="small-hint">
+          Cada columna necesita:<br>
+          - Referencia (texto del encabezado)<br>
+          - Exclusiones (encabezados que no quieres capturar)
+        </div>
+
+        <div style="margin-top:0.5rem;">
+          <button class="outline" onclick="generarInputs()">Generar campos</button>
+          <button class="outline" onclick="cargarFormatoDefault()">Formato tabla vehículos</button>
+        </div>
+      </div>
+
+      <div class="col" style="min-width:200px;max-width:220px;">
+        <label for="paginaInicio">Página inicio (1-based)</label>
+        <input type="number" id="paginaInicio" min="1" value="1">
+
+        <label for="paginaFin">Página fin (1-based)</label>
+        <input type="number" id="paginaFin" min="1" value="999">
+
+        <div class="small-hint">
+          Solo se procesan las páginas en este rango.<br>
+          Úsalo para saltar el texto inicial y los anexos finales.
+        </div>
+      </div>
     </div>
   </div>
 
@@ -187,7 +201,7 @@
       <span onclick="agregarReferencia('MATRÍCULA')">Matrícula</span>
     </div>
     <div class="small-hint">
-      Puedes hacer click y se rellena el primer campo vacío de "Referencia".
+      Haz click y relleno la primera referencia vacía.
     </div>
   </div>
 
@@ -204,9 +218,7 @@
   </div>
 
   <script>
-    // ⬇⬇⬇ IMPORTANTE: esta URL DEBE ser la pública del backend en Codespaces puerto 8001
-    // y debe terminar en /procesar/
-    // si tu codespace cambia de nombre, actualiza aquí
+    // ⚠ Ajusta este dominio si cambiaste de Codespace. Debe apuntar al backend (puerto 8001)
     const API_URL = "https://weary-cape-v6gp9gxg7jj52wqpw-8001.app.github.dev/procesar/";
 
     function mostrarNombreArchivo() {
@@ -241,7 +253,6 @@
       }
     }
 
-    // Rellena automáticamente las 4 columnas tipo de tu PDF
     function cargarFormatoDefault() {
       document.getElementById("numColumnas").value = 4;
       generarInputs();
@@ -255,11 +266,10 @@
       ];
       for (let i = 0; i < headers.length; i++) {
         refs[i].value = headers[i];
-        excls[i].value = headers[i]; // excluir el encabezado en sí
+        excls[i].value = headers[i]; // excluye la cabecera repetida
       }
     }
 
-    // Mete una referencia sugerida en el primer campo vacío
     function agregarReferencia(valor) {
       const inputs = document.querySelectorAll("input.referencia");
       for (let i = 0; i < inputs.length; i++) {
@@ -274,6 +284,9 @@
       const file = document.getElementById('fileInput').files[0];
       const referencias = [];
       const exclusiones = {};
+
+      const paginaInicio = parseInt(document.getElementById("paginaInicio").value);
+      const paginaFin = parseInt(document.getElementById("paginaFin").value);
 
       const bloques = document.querySelectorAll(".columna-container");
       bloques.forEach(bloque => {
@@ -297,6 +310,8 @@
       formData.append("file", file);
       formData.append("referencias", JSON.stringify(referencias));
       formData.append("exclusiones", JSON.stringify(exclusiones));
+      formData.append("pagina_inicio", paginaInicio.toString());
+      formData.append("pagina_fin", paginaFin.toString());
 
       const estado = document.getElementById("estado");
       estado.className = "";
@@ -328,7 +343,7 @@
       }
     }
 
-    // inicializa formulario con las 4 columnas
+    // inicializa formulario con las 4 columnas y exclusiones típicas
     cargarFormatoDefault();
   </script>
 </body>
