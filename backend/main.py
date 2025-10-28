@@ -9,9 +9,9 @@ import re
 from openpyxl import Workbook
 
 app = FastAPI(
-    title="PDF Table Extractor (RAW mode)",
-    description="Extrae filas crudas de tablas PDF y las vuelca en Excel para post-procesar.",
-    version="2.0.0"
+    title="PDF Table Extractor (RAW line only)",
+    description="Extrae cada fila de la tabla como una sola línea de texto en Excel.",
+    version="2.1.0"
 )
 
 # ⚠ Ajusta dominios si tu codespace cambia de nombre
@@ -31,29 +31,19 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Detecta NIF/NIE/CIF
+# Detectar NIF/NIE/CIF como "ancla fiscal"
 PAT_ID_GENERAL = re.compile(
-    r"""^(
+    r"""(
         [A-Z]\d{8}           |   # CIF tipo B26249896
         \d{8}[A-Z]           |   # NIF tipo 40313009N
         [XYZ]\d{7}[A-Z]          # NIE tipo X1234567A
-    )$""",
-    re.VERBOSE
-)
-
-def es_id_fiscal(token: str) -> bool:
-    token = token.strip().replace(" ", "")
-    return bool(PAT_ID_GENERAL.match(token))
-
-# Para la hoja NIE_Warnings (sacamos todos los IDs fiscales que aparezcan)
-PAT_ID_GLOBAL = re.compile(
-    r"""(
-        [A-Z]\d{8}           |
-        \d{8}[A-Z]           |
-        [XYZ]\d{7}[A-Z]
     )""",
     re.VERBOSE
 )
+
+def parece_id_fiscal_en_linea(texto: str) -> bool:
+    # devuelve True si encontramos algún identificador fiscal en la línea
+    return bool(PAT_ID_GENERAL.search(texto))
 
 def normalizar(s: str) -> str:
     import unicodedata
@@ -67,6 +57,7 @@ def normalizar(s: str) -> str:
     return s
 
 def header_match(span_text: str, referencia: str) -> bool:
+    # Comparamos texto del PDF con el encabezado esperado (ignorando mayúsculas/tildes)
     norm_span = normalizar(span_text)
     norm_ref = normalizar(referencia)
     if norm_ref in norm_span or norm_span in norm_ref:
@@ -86,58 +77,49 @@ async def procesar_pdf(
     pagina_fin: int = Form(...)
 ):
     """
-    Modo RAW:
-    - Lee únicamente las páginas [pagina_inicio-1 .. pagina_fin-1]
-    - A partir de la primera página donde vea headers tipo 'NOMBRE...', 'NIF', etc.,
-      empieza a capturar filas.
+    Modo RAW simple:
+    - Lee sólo páginas en el rango.
+    - Empieza a capturar después de ver headers tipo:
+      'NOMBRE Y APELLIDOS O RAZÓN SOCIAL', 'NIF', 'MARCA', 'MATRÍCULA'.
     - Para cada fila visual:
         - Ordena spans por X
-        - Concatena TODOS los spans en orden -> RAW_LINE
-        - Detecta el primer token que parece NIF/CIF/NIE -> NIF_DETECTADO
-        - Después del NIF, primer token -> MARCA_POSIBLE
-        - Después del NIF, segundo token -> MATRICULA_POSIBLE
-    - Excel final: columnas RAW_LINE, NIF_DETECTADO, MARCA_POSIBLE, MATRICULA_POSIBLE
+        - Une TODO como una sola línea
+        - Filtra ruido tipo '¿' o líneas vacías
+    - Genera Excel con una sola columna: RAW_LINE
     """
 
-    # 1. Parsear los extras del formulario
+    # 1. Cargar y parsear las referencias/exclusiones/envío del front
     try:
         referencias_list: List[str] = json.loads(referencias)
         exclusiones_map: Dict[str, List[str]] = json.loads(exclusiones)
     except Exception:
         return {"error": "No se pudo leer referencias o exclusiones"}
 
+    # 2. Convertir páginas 1-based → 0-based
     start_page = max(pagina_inicio - 1, 0)
     end_page = max(pagina_fin - 1, start_page)
 
-    # 2. Guardar PDF temporal
+    # 3. Guardar PDF temporalmente
     original_name = file.filename or "archivo.pdf"
     temp_pdf = f"/tmp/{uuid.uuid4().hex}_{original_name}"
     with open(temp_pdf, "wb") as f:
         f.write(await file.read())
 
-    # 3. Abrir con PyMuPDF
+    # 4. Abrir con PyMuPDF
     doc = fitz.open(temp_pdf)
     end_page = min(end_page, len(doc) - 1)
 
-    # 4. Detectar IDs fiscales globales (para la pestaña NIE_Warnings)
-    ids_detectados = set()
-    for pageno in range(start_page, end_page + 1):
-        page_text = doc[pageno].get_text("text")
-        for m in PAT_ID_GLOBAL.findall(page_text):
-            ids_detectados.add(m.strip())
+    TOL_Y = 4  # tolerancia vertical para agrupar spans en una fila visual
+    filas_raw: List[str] = []
 
-    TOL_Y = 4  # tolerancia vertical
+    en_modo_tabla = False  # se activa cuando detectamos encabezados
 
-    filas_totales = []
-
-    en_modo_tabla = False  # aún no hemos visto cabecera de tabla
-
-    # 5. Recorremos sólo el rango de páginas
+    # 5. Recorremos el rango de páginas
     for pageno in range(start_page, end_page + 1):
         page = doc[pageno]
         page_dict = page.get_text("dict")
 
-        # 5.1 ¿Esta página parece tener cabecera?
+        # 5.1 Detectar headers en esta página
         pagina_tiene_header = False
         for block in page_dict["blocks"]:
             for line in block.get("lines", []):
@@ -151,11 +133,11 @@ async def procesar_pdf(
         if pagina_tiene_header:
             en_modo_tabla = True
 
-        # si todavía no hemos llegado a las tablas, saltar
         if not en_modo_tabla:
+            # si aún no apareció cabecera de tabla, saltamos esta página
             continue
 
-        # 5.2 Agrupar spans por fila visual Y
+        # 5.2 Agrupar spans por fila en esta página
         filas_pag_cruda: List[Tuple[float, List[dict]]] = []
 
         for block in page_dict["blocks"]:
@@ -164,16 +146,16 @@ async def procesar_pdf(
                 if not spans:
                     continue
 
+                # centro vertical aproximado de esta línea
                 ys = [s["bbox"][1] for s in spans] + [s["bbox"][3] for s in spans]
                 y_centro = (min(ys) + max(ys)) / 2.0
 
-                # buscar fila con Y cercano
+                # buscar fila existente con Y cercana
                 fila_idx = None
                 for idx, (y_exist, _) in enumerate(filas_pag_cruda):
                     if abs(y_exist - y_centro) <= TOL_Y:
                         fila_idx = idx
                         break
-
                 if fila_idx is None:
                     filas_pag_cruda.append((y_centro, []))
                     fila_idx = len(filas_pag_cruda) - 1
@@ -183,101 +165,77 @@ async def procesar_pdf(
                     if not texto_span:
                         continue
 
-                    # descartamos cosas que no son contenido de fila:
-                    # - numeritos tipo "51"
+                    # ignorar numeritos de paginación suelta (ej. "51")
                     if re.fullmatch(r"\d{1,3}", texto_span):
                         continue
 
-                    # - encabezados repetidos
+                    # ignorar headers repetidos
                     if any(header_match(texto_span, ref) for ref in referencias_list):
                         continue
 
-                    # - exclusiones explícitas (por ejemplo, el nombre del header)
-                    skip_it = False
+                    # ignorar exclusiones explícitas definidas por el usuario
+                    saltar = False
                     for ref in referencias_list:
                         if texto_span in exclusiones_map.get(ref, []):
-                            skip_it = True
+                            saltar = True
                             break
-                    if skip_it:
+                    if saltar:
                         continue
 
                     x0, y0, x1, y1 = s["bbox"]
                     filas_pag_cruda[fila_idx][1].append({
                         "text": texto_span,
-                        "x0": x0,
+                        "x0": x0
                     })
 
-        # 5.3 Procesar cada fila cruda en modo "lineal"
+        # 5.3 Transformar cada fila cruda en una línea plana
         for (_, spans_de_fila) in filas_pag_cruda:
             if not spans_de_fila:
                 continue
 
-            # ordenar TODOS los spans de la fila de izquierda a derecha
+            # ordenar por X izquierda→derecha
             spans_sorted = sorted(spans_de_fila, key=lambda sp: sp["x0"])
+            tokens = [sp["text"] for sp in spans_sorted]
 
-            # reconstrucción lineal
-            tokens_line = [sp["text"] for sp in spans_sorted]
-            raw_line = " ".join(tokens_line).strip()
+            # unir todo
+            raw_line = " ".join(tokens)
+            # limpiar espacios múltiples
+            raw_line = re.sub(r"\s+", " ", raw_line).strip()
 
-            # detectar el primer identificador fiscal
-            nif_detectado = ""
-            marca_val = ""
-            matric_val = ""
-
-            fase = "antes_nif"
-            for tok in tokens_line:
-                if fase == "antes_nif":
-                    if es_id_fiscal(tok):
-                        nif_detectado = tok
-                        fase = "despues_nif"
-                elif fase == "despues_nif":
-                    if not marca_val:
-                        marca_val = tok
-                    elif not matric_val:
-                        matric_val = tok
-                    else:
-                        # Si aparece texto extra después de matrícula, podemos anexarlo a matrícula
-                        matric_val = (matric_val + " " + tok).strip()
-
-            # descartamos filas que están demasiado vacías
             if not raw_line:
                 continue
 
-            filas_totales.append({
-                "RAW_LINE": raw_line,
-                "NIF_DETECTADO": nif_detectado,
-                "MARCA_POSIBLE": marca_val,
-                "MATRICULA_POSIBLE": matric_val
-            })
+            # Filtrar ruido:
+            # - si es muy corto (1-2 chars) ignoramos
+            if len(raw_line) < 4:
+                continue
+
+            # - si no tiene ningún ID fiscal Y además parece ser basura tipo "¿"
+            #   (por ejemplo una sola palabra minúscula rara), también ignoramos
+            if not parece_id_fiscal_en_linea(raw_line):
+                # medir cuántas "palabras decentes" tiene
+                palabras = [p for p in raw_line.split() if len(p) > 2]
+                if len(palabras) < 2:
+                    # ej "¿" o "i" o "¿ i"
+                    continue
+
+            # si pasó los filtros, la guardamos
+            filas_raw.append(raw_line)
 
     doc.close()
 
-    # 6. Crear Excel final en modo RAW
+    # 6. Construir Excel con una sola columna
     wb = Workbook()
     ws = wb.active
-    ws.title = "RAW_FILAS"
+    ws.title = "FILAS_RAW"
 
-    ws.append([
-        "RAW_LINE",
-        "NIF_DETECTADO",
-        "MARCA_POSIBLE",
-        "MATRICULA_POSIBLE"
-    ])
+    ws.append(["RAW_LINE"])
 
-    for fila in filas_totales:
-        ws.append([
-            fila.get("RAW_LINE", ""),
-            fila.get("NIF_DETECTADO", ""),
-            fila.get("MARCA_POSIBLE", ""),
-            fila.get("MATRICULA_POSIBLE", "")
-        ])
+    for linea in filas_raw:
+        ws.append([linea])
 
-    # Hoja secundaria con todos los IDs fiscales detectados en el rango
-    if ids_detectados:
-        ws_alerta = wb.create_sheet("NIE_Warnings")
-        ws_alerta.append(["NIF/NIE/CIF Detectados"])
-        for codigo in sorted(ids_detectados):
-            ws_alerta.append([codigo])
+    # Nota: ya NO incluimos NIE_Warnings ni columnas separadas,
+    # porque la idea ahora es que tú hagas el split lógico en Google Sheets.
 
     output_path = f"/tmp/resultado_{uuid.uuid4().hex}.xlsx"
     wb.save(output_path)
